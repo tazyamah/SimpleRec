@@ -1,0 +1,15 @@
+# Swift build artifacts
+.build/
+
+# macOS
+.DS_Store
+
+# Icon generation intermediates (regenerate with: swift make_icon.swift)
+AppIcon_1024.png
+AppIcon.iconset/
+
+# Built app bundle in working directory (deployed copy lives in /Applications)
+SimpleRec.app/
+
+# Claude Code local settings
+.claude/settings.local.json
