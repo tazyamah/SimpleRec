@@ -6,6 +6,12 @@ import WhisperKit
 //  differs in your installed version, this is the ONLY file you need to adjust.
 // ============================================================================
 
+struct SegmentInfo {
+    let start: Double   // seconds from the start of the audio file passed to transcribe()
+    let end: Double
+    let text: String
+}
+
 actor Transcriber {
     private var whisper: WhisperKit?
     private let modelsDir: URL
@@ -32,11 +38,11 @@ actor Transcriber {
         try FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
         RecLog.shared.log("whisper: loading model=\(modelName) into \(modelsDir.path)")
 
-        // NOTE: convenience initializer used by current WhisperKit (2026).
-        // If your version differs, adjust here (e.g. use WhisperKitConfig).
+        // downloadBase = parent dir; WhisperKit creates the model subfolder inside it.
+        // Do NOT pass modelFolder here — that skips download entirely (setupModels L.314).
         let wk = try await WhisperKit(
             model: modelName,
-            modelFolder: modelsDir.path,
+            downloadBase: modelsDir,
             download: true
         )
         whisper = wk
@@ -47,19 +53,23 @@ actor Transcriber {
         RecLog.shared.log("whisper: model ready")
     }
 
-    /// Transcribe one audio file (m4a is supported directly) -> plain text.
-    func transcribe(_ audioURL: URL) async throws -> String {
+    /// Transcribe one audio file (m4a is supported directly).
+    /// Returns the concatenated text and all segments with timestamps relative to the file start.
+    func transcribe(_ audioURL: URL) async throws -> (text: String, segments: [SegmentInfo]) {
         try await ensureLoaded()
         guard let wk = whisper else {
             throw NSError(domain: "SimpleRec", code: 10,
                           userInfo: [NSLocalizedDescriptionKey: "モデルが読み込まれていません"])
         }
         RecLog.shared.log("whisper: transcribe \(audioURL.lastPathComponent)")
-        let results = try await wk.transcribe(audioPath: audioURL.path)
-        // results: [TranscriptionResult]; concatenate the text of each.
+        let options = DecodingOptions(language: "ja", skipSpecialTokens: true)
+        let results = try await wk.transcribe(audioPath: audioURL.path, decodeOptions: options)
         let text = results.map { $0.text }.joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        RecLog.shared.log("whisper: done (\(text.count) chars)")
-        return text
+        let segments = results.flatMap { $0.segments }.map {
+            SegmentInfo(start: Double($0.start), end: Double($0.end), text: $0.text)
+        }
+        RecLog.shared.log("whisper: done (\(text.count) chars, \(segments.count) segments)")
+        return (text: text, segments: segments)
     }
 }

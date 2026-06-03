@@ -35,6 +35,7 @@ rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 cp "Resources/Info.plist" "${APP_DIR}/Contents/Info.plist"
+[[ -f "Resources/AppIcon.icns" ]] && cp "Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
 # Stamp a build version so the running app shows which build it is.
 BUILD_ID="$(date +%Y%m%d.%H%M%S)"

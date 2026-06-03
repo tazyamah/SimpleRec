@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var recorder: AudioRecorder
 
     private let newTag = "__new__"
+    @State private var showTranscribeConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -102,18 +103,48 @@ struct ContentView: View {
                 Button("フォルダを開く") { recorder.openSelectedInFinder() }
                     .controlSize(.small)
 
-                // Transcription (stage 2-a: mic -> transcript_self.txt)
+                // Transcription
+                HStack(spacing: 6) {
+                    Text("モデル").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: $recorder.selectedModelName) {
+                        ForEach(AudioRecorder.modelOptions, id: \.self) { n in
+                            Text(n).tag(n)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(recorder.isTranscribing || recorder.isRecording)
+                }
                 HStack(spacing: 8) {
                     if !recorder.modelReady {
                         Button("モデルを取得") { recorder.downloadModel() }
                             .controlSize(.small)
                             .disabled(recorder.isTranscribing)
                     }
-                    Button("文字起こし（自分）") { recorder.transcribeSelected() }
-                        .controlSize(.small)
-                        .disabled(recorder.isTranscribing || recorder.isRecording
-                                  || recorder.selectedRecording == nil)
+                    Button("文字起こし") {
+                        if recorder.transcriptSelfExists || recorder.transcriptOtherExists || recorder.transcriptMergedExists {
+                            showTranscribeConfirm = true
+                        } else {
+                            recorder.transcribeSelected()
+                        }
+                    }
+                    .controlSize(.small)
+                    .disabled(recorder.isTranscribing || recorder.isRecording
+                              || recorder.selectedRecording == nil)
+                    .alert("文字起こしを再作成しますか？", isPresented: $showTranscribeConfirm) {
+                        Button("キャンセル", role: .cancel) {}
+                        Button("再作成", role: .destructive) { recorder.transcribeSelected() }
+                    } message: {
+                        Text("選択中のモデルで生成済みのファイルを上書きします。")
+                    }
                     if recorder.isTranscribing { ProgressView().controlSize(.small) }
+                }
+                if recorder.selectedRecording != nil {
+                    HStack(spacing: 10) {
+                        transcriptBadge("自分",  exists: recorder.transcriptSelfExists)
+                        transcriptBadge("相手",  exists: recorder.transcriptOtherExists)
+                        transcriptBadge("マージ", exists: recorder.transcriptMergedExists)
+                    }
                 }
                 if !recorder.transcriptionStatus.isEmpty {
                     Text(recorder.transcriptionStatus)
@@ -149,6 +180,13 @@ struct ContentView: View {
 
     private func toggle() {
         recorder.isRecording ? recorder.stopRecording() : recorder.startRecording()
+    }
+
+    @ViewBuilder
+    private func transcriptBadge(_ label: String, exists: Bool) -> some View {
+        Label(label, systemImage: exists ? "checkmark.circle.fill" : "circle")
+            .font(.caption2)
+            .foregroundStyle(exists ? Color.green : Color.secondary)
     }
 
     private func timeString(_ t: TimeInterval) -> String {

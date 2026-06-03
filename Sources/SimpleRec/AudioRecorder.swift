@@ -284,7 +284,17 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published var modelReady = false
     @Published var isTranscribing = false
     @Published var transcriptionStatus = ""
-    private let modelName = "large-v3-turbo"
+    @Published var transcriptSelfExists = false
+    @Published var transcriptOtherExists = false
+    @Published var transcriptMergedExists = false
+    static let modelOptions = [
+        "openai_whisper-large-v3_turbo",
+        "openai_whisper-large-v3",
+        "openai_whisper-medium",
+        "openai_whisper-small"
+    ]
+    @Published var selectedModelName: String
+    private var cancellables = Set<AnyCancellable>()
 
     private let sampleRate: Double = 48_000
     private let channelCount: AVAudioChannelCount = 2
@@ -320,12 +330,20 @@ final class AudioRecorder: NSObject, ObservableObject {
         sysPump = AudioPump(name: "sys", sampleRate: 48_000, channels: 2)
         micPump = AudioPump(name: "mic", sampleRate: 48_000, channels: 2)
         procFormat = sysPump.procFormat
+        let saved = UserDefaults.standard.string(forKey: "selectedModelName") ?? ""
+        selectedModelName = AudioRecorder.modelOptions.contains(saved)
+            ? saved : AudioRecorder.modelOptions[0]
         super.init()
         resolveSavedLibrary()
         updateLibraryDisplay()
         refreshRecordings()
         refreshModelState()
         refreshScreenPermission()
+        $selectedModelName.dropFirst().sink { [weak self] name in
+            UserDefaults.standard.set(name, forKey: "selectedModelName")
+            self?.refreshModelState()
+            self?.refreshTranscriptState()
+        }.store(in: &cancellables)
     }
 
     /// Reflect current Screen Recording grant into the UI flag (no dialog).
@@ -356,14 +374,27 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 
     func refreshModelState() {
-        modelReady = Transcriber.isModelReady(modelsDir: modelsDir(), modelName: modelName)
+        modelReady = Transcriber.isModelReady(modelsDir: modelsDir(), modelName: selectedModelName)
+    }
+
+    func refreshTranscriptState() {
+        guard let sel = selectedRecording else {
+            transcriptSelfExists = false; transcriptOtherExists = false; transcriptMergedExists = false
+            return
+        }
+        let folder = library().appendingPathComponent(sel, isDirectory: true)
+        let fm = FileManager.default
+        let s = "_\(selectedModelName)"
+        transcriptSelfExists   = fm.fileExists(atPath: folder.appendingPathComponent("transcript_self\(s).txt").path)
+        transcriptOtherExists  = fm.fileExists(atPath: folder.appendingPathComponent("transcript_other\(s).txt").path)
+        transcriptMergedExists = fm.fileExists(atPath: folder.appendingPathComponent("transcript\(s).txt").path)
     }
 
     func downloadModel() {
         guard !isTranscribing else { return }
         isTranscribing = true
         transcriptionStatus = "モデルを取得中…（初回は数百MB、しばらくかかります）"
-        let dir = modelsDir(); let name = modelName
+        let dir = modelsDir(); let name = selectedModelName
         Task {
             do {
                 let t = Transcriber(modelsDir: dir, modelName: name)
@@ -382,37 +413,122 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Stage 2-a: transcribe the selected recording's mic_part01.m4a into transcript_self.txt
     func transcribeSelected() {
         guard !isTranscribing, !isRecording, let sel = selectedRecording else {
             transcriptionStatus = "レコーディングを選択してください"; return
         }
         let folder = library().appendingPathComponent(sel, isDirectory: true)
-        let mic = folder.appendingPathComponent("mic_part01.m4a")
-        guard FileManager.default.fileExists(atPath: mic.path) else {
-            transcriptionStatus = "mic_part01.m4a が見つかりません"; return
+        let micParts = partFiles(in: folder, prefix: "mic")
+        let sysParts = partFiles(in: folder, prefix: "system")
+        guard !micParts.isEmpty || !sysParts.isEmpty else {
+            transcriptionStatus = "音声ファイルが見つかりません"; return
         }
         isTranscribing = true
         transcriptionStatus = "文字起こし中…"
-        let dir = modelsDir(); let name = modelName
+        let dir = modelsDir(); let name = selectedModelName
+
         Task {
             do {
                 let t = Transcriber(modelsDir: dir, modelName: name)
-                let text = try await t.transcribe(mic)
-                let out = folder.appendingPathComponent("transcript_self.txt")
-                try text.write(to: out, atomically: true, encoding: .utf8)
-                await MainActor.run {
-                    self.modelReady = true
-                    self.transcriptionStatus = "完了: transcript_self.txt を書き出しました"
-                    self.isTranscribing = false
+
+                // モデルのロード（未ダウンロードなら数百MBのダウンロードが走る）
+                transcriptionStatus = modelReady
+                    ? "モデルをロード中…"
+                    : "モデルをダウンロード中…（初回は数百MB、しばらくかかります）"
+                try await t.ensureLoaded()
+                modelReady = true
+
+                // mic パートを順に処理
+                var selfText = ""
+                var micSegs: [(start: Double, text: String)] = []
+                var micOffset = 0.0
+                for (i, url) in micParts.enumerated() {
+                    transcriptionStatus = "文字起こし中… 自分 \(i + 1)/\(micParts.count)"
+                    let (text, segs) = try await t.transcribe(url)
+                    if !selfText.isEmpty { selfText += " " }
+                    selfText += text
+                    for seg in segs {
+                        let s = seg.text.trimmingCharacters(in: .whitespaces)
+                        if !s.isEmpty { micSegs.append((start: seg.start + micOffset, text: s)) }
+                    }
+                    micOffset += audioDuration(url)
                 }
+
+                // system パートを順に処理
+                var otherText = ""
+                var sysSegs: [(start: Double, text: String)] = []
+                var sysOffset = 0.0
+                for (i, url) in sysParts.enumerated() {
+                    transcriptionStatus = "文字起こし中… 相手 \(i + 1)/\(sysParts.count)"
+                    let (text, segs) = try await t.transcribe(url)
+                    if !otherText.isEmpty { otherText += " " }
+                    otherText += text
+                    for seg in segs {
+                        let s = seg.text.trimmingCharacters(in: .whitespaces)
+                        if !s.isEmpty { sysSegs.append((start: seg.start + sysOffset, text: s)) }
+                    }
+                    sysOffset += audioDuration(url)
+                }
+
+                // 出力ファイルを書き出す（ファイル名にモデル名を含める）
+                let fileSuffix = "_\(name)"
+                var written: [String] = []
+                if !selfText.isEmpty {
+                    let fname = "transcript_self\(fileSuffix).txt"
+                    try selfText.write(to: folder.appendingPathComponent(fname),
+                                       atomically: true, encoding: .utf8)
+                    written.append(fname)
+                }
+                if !otherText.isEmpty {
+                    let fname = "transcript_other\(fileSuffix).txt"
+                    try otherText.write(to: folder.appendingPathComponent(fname),
+                                        atomically: true, encoding: .utf8)
+                    written.append(fname)
+                }
+                let merged = mergeTranscripts(mic: micSegs, sys: sysSegs)
+                if !merged.isEmpty {
+                    let fname = "transcript\(fileSuffix).txt"
+                    try merged.write(to: folder.appendingPathComponent(fname),
+                                     atomically: true, encoding: .utf8)
+                    written.append(fname)
+                }
+                RecLog.shared.log("transcribe: done, wrote \(written.joined(separator: ", "))")
+                refreshTranscriptState()
+                modelReady = true
+                transcriptionStatus = written.isEmpty
+                    ? "文字起こし結果なし"
+                    : "完了: \(written.joined(separator: ", "))"
+                isTranscribing = false
             } catch {
-                await MainActor.run {
-                    self.transcriptionStatus = "文字起こし失敗: \(error.localizedDescription)"
-                    self.isTranscribing = false
-                }
+                transcriptionStatus = "文字起こし失敗: \(error.localizedDescription)"
+                isTranscribing = false
             }
         }
+    }
+
+    private func partFiles(in folder: URL, prefix: String) -> [URL] {
+        let all = (try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: nil)) ?? []
+        return all
+            .filter { $0.lastPathComponent.hasPrefix(prefix + "_part") && $0.pathExtension == "m4a" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private func audioDuration(_ url: URL) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        return Double(file.length) / file.processingFormat.sampleRate
+    }
+
+    private func mergeTranscripts(
+        mic: [(start: Double, text: String)],
+        sys: [(start: Double, text: String)]
+    ) -> String {
+        struct Line { let start: Double; let text: String }
+        let lines = mic.map { Line(start: $0.start, text: "[自分] \($0.text)") }
+                   + sys.map { Line(start: $0.start, text: "[相手] \($0.text)") }
+        return lines.sorted { $0.start < $1.start }
+                    .map { $0.text }
+                    .joined(separator: "\n")
     }
 
     // MARK: Library & recordings
@@ -458,9 +574,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         try? fm.createDirectory(at: lib, withIntermediateDirectories: true)
         let items = (try? fm.contentsOfDirectory(at: lib, includingPropertiesForKeys: [.isDirectoryKey],
                                                  options: [.skipsHiddenFiles])) ?? []
-        let dirs = items.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-                        .map { $0.lastPathComponent }
-                        .sorted(by: >)   // timestamp prefix sorts newest first
+        let dirs = items.filter {
+                        (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                        && !$0.lastPathComponent.hasPrefix("_")  // exclude system folders (_models etc.)
+                    }
+                    .map { $0.lastPathComponent }
+                    .sorted(by: >)   // timestamp prefix sorts newest first
         recordings = dirs
         if let sel = selectedRecording, !dirs.contains(sel) { selectedRecording = nil }
     }
@@ -479,10 +598,11 @@ final class AudioRecorder: NSObject, ObservableObject {
     func selectRecording(_ name: String?) {
         selectedRecording = name
         if let name = name {
-            recordingName = suffix(of: name)   // populate field with current name for rename
+            recordingName = suffix(of: name)
         } else {
             recordingName = ""
         }
+        refreshTranscriptState()
     }
 
     /// Rename the selected (stopped) recording's folder, keeping its timestamp prefix.
