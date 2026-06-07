@@ -3,6 +3,8 @@ import AppKit
 
 struct ContentView: View {
     @EnvironmentObject var recorder: AudioRecorder
+    @AppStorage("menuBarMode") private var menuBarMode = false
+    @Environment(\.openWindow) private var openWindow
 
     private let newTag = "__new__"
     @State private var showTranscribeConfirm = false
@@ -160,6 +162,14 @@ struct ContentView: View {
             }
             Spacer(minLength: 0)
 
+            Button(menuBarMode ? "ウィンドウモードに切り替え" : "メニューバーモードに切り替え") {
+                toggleMode()
+            }
+            .controlSize(.mini)
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .center)
+
             Text("build \(buildVersion)")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -187,6 +197,22 @@ struct ContentView: View {
         Label(label, systemImage: exists ? "checkmark.circle.fill" : "circle")
             .font(.caption2)
             .foregroundStyle(exists ? Color.green : Color.secondary)
+    }
+
+    private func toggleMode() {
+        if menuBarMode {
+            menuBarMode = false
+            NSApp.setActivationPolicy(.regular)
+            if let w = NSApp.windows.first(where: { !($0 is NSPanel) }) {
+                w.makeKeyAndOrderFront(nil)
+            } else {
+                openWindow(id: "main")
+            }
+        } else {
+            menuBarMode = true
+            NSApp.setActivationPolicy(.accessory)
+            NSApp.windows.filter { !($0 is NSPanel) }.forEach { $0.orderOut(nil) }
+        }
     }
 
     private func timeString(_ t: TimeInterval) -> String {
