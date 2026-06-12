@@ -56,6 +56,10 @@ struct ContentView: View {
             .toggleStyle(.checkbox)
             .disabled(recorder.isRecording)
 
+            Toggle("Zoom自動録音", isOn: $recorder.autoRecordZoom)
+                .toggleStyle(.checkbox)
+                .disabled(recorder.isRecording)
+
             // Recording name (applies to the active/just-recorded or selected recording)
             VStack(alignment: .leading, spacing: 4) {
                 Text("録音名（任意）").font(.caption).foregroundStyle(.secondary)
@@ -162,8 +166,15 @@ struct ContentView: View {
             }
             Spacer(minLength: 0)
 
-            Button(menuBarMode ? "ウィンドウモードに切り替え" : "メニューバーモードに切り替え") {
-                toggleMode()
+            HStack(spacing: 8) {
+                Button(menuBarMode ? "ウィンドウモードに切り替え" : "メニューバーモードに切り替え") {
+                    toggleMode()
+                }
+                if menuBarMode {
+                    Text("·").foregroundStyle(.tertiary)
+                    Button("終了") { NSApp.terminate(nil) }
+                        .foregroundStyle(.red)
+                }
             }
             .controlSize(.mini)
             .buttonStyle(.plain)

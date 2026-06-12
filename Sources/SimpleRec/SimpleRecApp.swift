@@ -1,14 +1,28 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            RecLog.shared.log("notifications: permission granted=\(granted)")
+        }
+
         if UserDefaults.standard.bool(forKey: "menuBarMode") {
             NSApp.setActivationPolicy(.accessory)
             DispatchQueue.main.async {
                 NSApp.windows.filter { !($0 is NSPanel) }.forEach { $0.orderOut(nil) }
             }
         }
+    }
+
+    // Show notifications even when the app is in foreground
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
 }
 

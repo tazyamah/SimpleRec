@@ -4,6 +4,7 @@ import ScreenCaptureKit
 import Combine
 import AppKit
 import CoreGraphics
+import UserNotifications
 
 // MARK: - Pump: converts incoming audio to a common format and buffers it
 
@@ -273,6 +274,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published var captureMic = true
     @Published var statusMessage = ""
     @Published var needsScreenPermission = false
+    @Published var autoRecordZoom = false
 
     // Library = parent folder chosen once. Recordings = its subfolders.
     @Published var libraryDisplay = ""
@@ -319,9 +321,13 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var startDate: Date?
     private var timer: Timer?
     private var isStarting = false
+    private let zoomMonitor = ZoomMonitor()
+    private var mixerWriteCountAtLastCheck = 0
+    private var watchdogTimer: Timer?
 
     private var activeRecordingFolder: URL?            // folder being recorded into
     private var activeTimestamp = ""                   // timestamp prefix of active recording
+    private var engineConfigObserver: NSObjectProtocol?
 
     private let bookmarkKey = "libraryBookmark"
     private var libraryURL: URL?
@@ -344,11 +350,64 @@ final class AudioRecorder: NSObject, ObservableObject {
             self?.refreshModelState()
             self?.refreshTranscriptState()
         }.store(in: &cancellables)
+
+        autoRecordZoom = UserDefaults.standard.bool(forKey: "autoRecordZoom")
+        $autoRecordZoom.dropFirst().sink { [weak self] enabled in
+            guard let self else { return }
+            UserDefaults.standard.set(enabled, forKey: "autoRecordZoom")
+            if enabled { self.startZoomMonitor() } else { self.zoomMonitor.stop() }
+        }.store(in: &cancellables)
+        if autoRecordZoom { startZoomMonitor() }
     }
 
     /// Reflect current Screen Recording grant into the UI flag (no dialog).
     func refreshScreenPermission() {
         needsScreenPermission = !CGPreflightScreenCaptureAccess()
+    }
+
+    // MARK: Zoom auto-recording
+
+    private func startZoomMonitor() {
+        zoomMonitor.onMeetingStart = { [weak self] in
+            Task { @MainActor in
+                guard let self = self, !self.isRecording else { return }
+                RecLog.shared.log("zoomMonitor: auto-start recording")
+                self.startRecording()
+                self.sendNotification(title: "録音を開始しました", body: "Zoomミーティングを検出しました")
+            }
+        }
+        zoomMonitor.onMeetingEnd = { [weak self] in
+            Task { @MainActor in
+                guard let self = self, self.isRecording else { return }
+                RecLog.shared.log("zoomMonitor: auto-stop recording")
+                self.stopRecording()
+                self.sendNotification(title: "録音を停止しました", body: "Zoomミーティングが終了しました")
+            }
+        }
+        zoomMonitor.start()
+    }
+
+    // MARK: Notifications
+
+    func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err { RecLog.shared.log("notification error: \(err.localizedDescription)") }
+        }
+    }
+
+    // MARK: Unexpected stop
+
+    private func unexpectedStop(reason: String) {
+        guard isRecording else { return }
+        RecLog.shared.log("unexpectedStop: \(reason)")
+        stopRecording()
+        statusMessage = "録音が予期せず終了しました: \(reason)"
+        sendNotification(title: "録音が予期せず終了しました", body: reason)
     }
 
     // MARK: Model / transcription (stage 2-a: mic -> transcript_self.txt)
@@ -701,7 +760,12 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     private func teardown(reason: String) {
         RecLog.shared.log("teardown: \(reason)")
+        watchdogTimer?.invalidate(); watchdogTimer = nil
         timer?.invalidate(); timer = nil
+        if let obs = engineConfigObserver {
+            NotificationCenter.default.removeObserver(obs)
+            engineConfigObserver = nil
+        }
         mixer?.stop(); mixer = nil
         if let s = stream {
             s.stopCapture { err in
@@ -825,6 +889,19 @@ final class AudioRecorder: NSObject, ObservableObject {
                 self.elapsed = Date().timeIntervalSince(s)
             }
         }
+        // Watchdog: detect if mixer stops producing data while isRecording is true
+        mixerWriteCountAtLastCheck = 0
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self, self.isRecording else { return }
+                let current = self.mixWriter?.writeCount ?? 0
+                if current == self.mixerWriteCountAtLastCheck {
+                    RecLog.shared.log("watchdog: mixer stalled at writeCount=\(current), stopping")
+                    self.unexpectedStop(reason: "録音データの書き込みが停止しました")
+                }
+                self.mixerWriteCountAtLastCheck = current
+            }
+        }
     }
 
     // MARK: Mic capture (input tap, no graph connections)
@@ -841,12 +918,30 @@ final class AudioRecorder: NSObject, ObservableObject {
                           userInfo: [NSLocalizedDescriptionKey: "マイク入力フォーマットが無効です"])
         }
         let pump = micPump
+        RecLog.shared.log("mic: installing tap…")
         input.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { buffer, _ in
             pump.pushPCM(buffer)
         }
         micTapInstalled = true
+        RecLog.shared.log("mic: preparing engine…")
         engine.prepare()
+        RecLog.shared.log("mic: calling engine.start()…")
         try engine.start()
+        RecLog.shared.log("mic: engine.start() returned")
+
+        // When Zoom (or any app) exits and changes audio routing, macOS automatically
+        // stops the engine. Catch this to tear down cleanly instead of crashing.
+        engineConfigObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            RecLog.shared.log("engine: AVAudioEngineConfigurationChange — audio route changed")
+            Task { @MainActor in
+                guard let self = self, self.isRecording else { return }
+                self.unexpectedStop(reason: "音声デバイスの設定が変更されました（Zoom終了等）")
+            }
+        }
     }
 
     // MARK: System audio capture
@@ -870,9 +965,15 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         let pump = sysPump
         let output = StreamOutput { sampleBuffer in pump.push(sampleBuffer) }
+        output.onError = { [weak self] error in
+            Task { @MainActor in
+                guard let self = self, self.isRecording else { return }
+                self.unexpectedStop(reason: "システム音声エラー: \(error.localizedDescription)")
+            }
+        }
         streamOutput = output
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let stream = SCStream(filter: filter, configuration: config, delegate: output)
         try stream.addStreamOutput(output, type: .audio,
                                    sampleHandlerQueue: DispatchQueue(label: "simplerec.audio"))
         try await stream.startCapture()
@@ -893,15 +994,92 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 }
 
-// MARK: - SCStream output handler
+// MARK: - SCStream output handler + delegate
 
-private final class StreamOutput: NSObject, SCStreamOutput, @unchecked Sendable {
+private final class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let onAudio: (CMSampleBuffer) -> Void
+    var onError: ((Error) -> Void)?
+
     init(onAudio: @escaping (CMSampleBuffer) -> Void) { self.onAudio = onAudio }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard type == .audio, sampleBuffer.isValid else { return }
         onAudio(sampleBuffer)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        RecLog.shared.log("scstream: didStopWithError: \(error.localizedDescription)")
+        onError?(error)
+    }
+}
+
+// MARK: - Zoom Meeting Monitor
+
+final class ZoomMonitor: @unchecked Sendable {
+    var onMeetingStart: (() -> Void)?
+    var onMeetingEnd: (() -> Void)?
+
+    private let queue = DispatchQueue(label: "simplerec.zoommonitor", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private var wasMeetingActive = false
+
+    func start() {
+        queue.async { [weak self] in
+            guard let self, self.timer == nil else { return }
+            let t = DispatchSource.makeTimerSource(queue: self.queue)
+            t.schedule(deadline: .now() + 1, repeating: 5)
+            t.setEventHandler { [weak self] in self?.check() }
+            self.timer = t
+            t.resume()
+            RecLog.shared.log("zoomMonitor: started (polling every 5s)")
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in
+            self?.timer?.cancel()
+            self?.timer = nil
+            self?.wasMeetingActive = false
+            RecLog.shared.log("zoomMonitor: stopped")
+        }
+    }
+
+    private func check() {
+        let active = isMeetingActive()
+        if active && !wasMeetingActive {
+            wasMeetingActive = true
+            RecLog.shared.log("zoomMonitor: meeting STARTED")
+            let cb = onMeetingStart
+            DispatchQueue.main.async { cb?() }
+        } else if !active && wasMeetingActive {
+            wasMeetingActive = false
+            RecLog.shared.log("zoomMonitor: meeting ENDED")
+            let cb = onMeetingEnd
+            DispatchQueue.main.async { cb?() }
+        }
+    }
+
+    private func isMeetingActive() -> Bool {
+        // Fast check: Zoom app must be running
+        let zoomRunning = NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "us.zoom.xos"
+        }
+        guard zoomRunning else { return false }
+
+        // CptHost is the audio/video subprocess that only runs during a Zoom meeting
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        task.arguments = ["-x", "CptHost"]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 }
 
