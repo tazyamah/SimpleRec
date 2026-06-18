@@ -319,11 +319,11 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var mixer: Mixer?
 
     private var startDate: Date?
-    private var timer: Timer?
+    private var elapsedTask: Task<Void, Never>?
     private var isStarting = false
     private let zoomMonitor = ZoomMonitor()
     private var mixerWriteCountAtLastCheck = 0
-    private var watchdogTimer: Timer?
+    private var watchdogTask: Task<Void, Never>?
 
     private var activeRecordingFolder: URL?            // folder being recorded into
     private var activeTimestamp = ""                   // timestamp prefix of active recording
@@ -760,8 +760,8 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     private func teardown(reason: String) {
         RecLog.shared.log("teardown: \(reason)")
-        watchdogTimer?.invalidate(); watchdogTimer = nil
-        timer?.invalidate(); timer = nil
+        watchdogTask?.cancel(); watchdogTask = nil
+        elapsedTask?.cancel(); elapsedTask = nil
         if let obs = engineConfigObserver {
             NotificationCenter.default.removeObserver(obs)
             engineConfigObserver = nil
@@ -883,24 +883,31 @@ final class AudioRecorder: NSObject, ObservableObject {
         isRecording = true
         statusMessage = "録音中…"
         RecLog.shared.log("recording: started")
-        timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, let s = self.startDate else { return }
-                self.elapsed = Date().timeIntervalSince(s)
-            }
-        }
-        // Watchdog: detect if mixer stops producing data while isRecording is true
-        mixerWriteCountAtLastCheck = 0
-        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, self.isRecording else { return }
-                let current = self.mixWriter?.writeCount ?? 0
-                if current == self.mixerWriteCountAtLastCheck {
-                    RecLog.shared.log("watchdog: mixer stalled at writeCount=\(current), stopping")
-                    self.unexpectedStop(reason: "録音データの書き込みが停止しました")
+
+        elapsedTask = Task { @MainActor [weak self] in
+            do {
+                while let self, self.isRecording {
+                    if let s = self.startDate { self.elapsed = Date().timeIntervalSince(s) }
+                    try await Task.sleep(for: .milliseconds(200))
                 }
-                self.mixerWriteCountAtLastCheck = current
-            }
+            } catch {}
+        }
+
+        mixerWriteCountAtLastCheck = 0
+        watchdogTask = Task { @MainActor [weak self] in
+            do {
+                while let self, self.isRecording {
+                    try await Task.sleep(for: .seconds(20))
+                    guard self.isRecording else { return }
+                    let current = self.mixWriter?.writeCount ?? 0
+                    if current == self.mixerWriteCountAtLastCheck {
+                        RecLog.shared.log("watchdog: mixer stalled at writeCount=\(current), stopping")
+                        self.unexpectedStop(reason: "録音データの書き込みが停止しました")
+                        return
+                    }
+                    self.mixerWriteCountAtLastCheck = current
+                }
+            } catch {}
         }
     }
 
