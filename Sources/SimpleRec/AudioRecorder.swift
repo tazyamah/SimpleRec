@@ -320,7 +320,7 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     private var startDate: Date?
     private var elapsedTask: Task<Void, Never>?
-    private var isStarting = false
+    private(set) var isStarting = false
     private let zoomMonitor = ZoomMonitor()
     private var mixerWriteCountAtLastCheck = 0
     private var watchdogTask: Task<Void, Never>?
@@ -370,16 +370,18 @@ final class AudioRecorder: NSObject, ObservableObject {
     private func startZoomMonitor() {
         zoomMonitor.onMeetingStart = { [weak self] in
             Task { @MainActor in
-                guard let self = self, !self.isRecording else { return }
-                RecLog.shared.log("zoomMonitor: auto-start recording")
+                guard let self = self else { RecLog.shared.log("zoomMonitor: onMeetingStart self=nil"); return }
+                RecLog.shared.log("zoomMonitor: onMeetingStart isRecording=\(self.isRecording) isStarting=\(self.isStarting)")
+                guard !self.isRecording else { return }
                 self.startRecording()
                 self.sendNotification(title: "録音を開始しました", body: "Zoomミーティングを検出しました")
             }
         }
         zoomMonitor.onMeetingEnd = { [weak self] in
             Task { @MainActor in
-                guard let self = self, self.isRecording else { return }
-                RecLog.shared.log("zoomMonitor: auto-stop recording")
+                guard let self = self else { RecLog.shared.log("zoomMonitor: onMeetingEnd self=nil"); return }
+                RecLog.shared.log("zoomMonitor: onMeetingEnd isRecording=\(self.isRecording) isStarting=\(self.isStarting)")
+                guard self.isRecording else { return }
                 self.stopRecording()
                 self.sendNotification(title: "録音を停止しました", body: "Zoomミーティングが終了しました")
             }
@@ -717,7 +719,16 @@ final class AudioRecorder: NSObject, ObservableObject {
         statusMessage = ""
         lastFiles = []
         selectedRecording = nil
-        Task { await self.startAsync() }
+        Task {
+            await self.startAsync()
+        }
+        // isStarting が stuck するのを防ぐ: 30秒以内に startAsync が完了しなければ強制リセット
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            guard let self = self, self.isStarting else { return }
+            RecLog.shared.log("startRecording: isStarting stuck after 30s, force-resetting")
+            self.isStarting = false
+        }
     }
 
     func stopRecording() {
@@ -915,7 +926,10 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     private func startMicCapture() throws {
         if engine.isRunning { engine.stop() }
-        if micTapInstalled { engine.inputNode.removeTap(onBus: 0); micTapInstalled = false }
+        // 状態フラグに依存せず必ず removeTap してから installTap する
+        // (前回セッションが異常終了してフラグがずれていても安全)
+        engine.inputNode.removeTap(onBus: 0)
+        micTapInstalled = false
 
         let input = engine.inputNode
         let micFormat = input.outputFormat(forBus: 0)
